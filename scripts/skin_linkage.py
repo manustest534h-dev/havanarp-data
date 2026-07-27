@@ -7,7 +7,7 @@ import struct
 from collections.abc import Iterable
 
 
-CUSTOM_SKIN_IDS = frozenset(
+NATIVE_SKIN_IDS = frozenset(
     {
         793,
         794,
@@ -33,6 +33,15 @@ CUSTOM_SKIN_IDS = frozenset(
         1203,
     }
 )
+
+CDN_SKIN_IDS = frozenset(
+    {
+        *range(16852, 16899),
+        *range(16900, 16915),
+    }
+)
+
+CUSTOM_SKIN_IDS = NATIVE_SKIN_IDS | CDN_SKIN_IDS
 
 BROKEN_PED_ROW = b"man,2,0 PED_TYPE_GEN"
 FIXED_PED_ROW = b"man,2,0,PED_TYPE_GEN"
