@@ -48,6 +48,7 @@ SAMP_TEXTURES = (
     "LuxuryMobile/texdb/samp/samp.dxt.dat",
     "LuxuryMobile/texdb/samp/samp.etc.dat",
     "LuxuryMobile/texdb/samp/samp.pvr.dat",
+    "LuxuryMobile/texdb/samp/samp.txt",
     "LuxuryMobile/texdb/samp/samp.unc.dat",
 )
 CUSTOM3_TEXTURES = tuple(
