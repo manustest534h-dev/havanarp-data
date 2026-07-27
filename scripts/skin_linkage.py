@@ -129,6 +129,62 @@ def parse_img_index(prefix: bytes) -> set[str]:
     return names
 
 
+def merge_img_archives(base: bytes, addon: bytes) -> bytes:
+    """Merge two GTA IMG v2 archives into one self-contained archive."""
+
+    def entries(payload: bytes) -> list[tuple[int, int, bytes, bytes]]:
+        required = img_index_size(payload)
+        if len(payload) % 2048:
+            raise SkinLinkageError("GTA IMG size is not sector aligned")
+        records: list[tuple[int, int, bytes, bytes]] = []
+        entry_count = struct.unpack_from("<I", payload, 4)[0]
+        for index in range(entry_count):
+            offset = 8 + (index * 32)
+            sector, stream_size, archive_size = struct.unpack_from(
+                "<IHH", payload, offset
+            )
+            raw_name = payload[offset + 8 : offset + 32]
+            sectors = archive_size or stream_size
+            start = sector * 2048
+            end = start + (sectors * 2048)
+            if not sectors or start < required or end > len(payload):
+                raise SkinLinkageError(f"invalid GTA IMG payload at index {index}")
+            records.append(
+                (stream_size, archive_size, raw_name, payload[start:end])
+            )
+        return records
+
+    base_names = parse_img_index(base)
+    addon_names = parse_img_index(addon)
+    overlap = base_names.intersection(addon_names)
+    if overlap == addon_names:
+        return base
+    if overlap:
+        raise SkinLinkageError(
+            "GTA IMG archives contain a partial duplicate model set: "
+            + ", ".join(sorted(overlap))
+        )
+
+    records = entries(base) + entries(addon)
+    index_size = 8 + (len(records) * 32)
+    first_sector = (index_size + 2047) // 2048
+    output = bytearray(first_sector * 2048)
+    output[:8] = b"VER2" + struct.pack("<I", len(records))
+    sector = first_sector
+    for index, (stream_size, archive_size, raw_name, payload) in enumerate(records):
+        offset = 8 + (index * 32)
+        output[offset : offset + 32] = struct.pack(
+            "<IHH24s", sector, stream_size, archive_size, raw_name
+        )
+        output.extend(payload)
+        sector += len(payload) // 2048
+
+    merged = bytes(output)
+    if parse_img_index(merged) != base_names | addon_names:
+        raise SkinLinkageError("merged GTA IMG index mismatch")
+    return merged
+
+
 def validate_skin_links(
     pedestrian_models: dict[int, str],
     img_names: set[str],

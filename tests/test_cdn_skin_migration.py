@@ -16,7 +16,12 @@ from cdn_skin_migration import (  # noqa: E402
     select_pedestrian_rows,
     texture_groups,
 )
-from patch_skin_release import add_cdn_pedestrians  # noqa: E402
+from patch_skin_release import (  # noqa: E402
+    add_cdn_pedestrians,
+    merge_texture_metadata,
+    merge_texture_toc,
+    remove_custom3_loader,
+)
 from skin_linkage import CDN_SKIN_IDS, parse_ped_definitions  # noqa: E402
 
 
@@ -123,6 +128,37 @@ class CdnSkinMigrationTests(unittest.TestCase):
 
         self.assertEqual(set(parsed), {51, *CDN_SKIN_IDS})
         self.assertLess(patched.index(b"16852,"), patched.rindex(b"end"))
+
+    def test_merges_texture_metadata_without_second_category_header(self) -> None:
+        base = b'cat=0 name=Default\n"base" width=1 height=1 img=1\n'
+        addon = b'cat=0 name=Default\n"skin" width=1 height=1 img=2\n'
+
+        merged = merge_texture_metadata(base, addon)
+
+        self.assertEqual(merged.count(b"cat=0"), 1)
+        self.assertEqual(parse_texture_catalog(merged), {"base", "skin"})
+
+    def test_merges_texture_offsets_and_preserves_missing_markers(self) -> None:
+        base = struct.pack("<III", 100, 0, 0xFFFFFFFF)
+        addon = struct.pack("<III", 40, 0, 20)
+
+        merged = merge_texture_toc(base, addon, 100, 40)
+
+        self.assertEqual(
+            struct.unpack("<IIIII", merged),
+            (140, 0, 0xFFFFFFFF, 100, 120),
+        )
+
+    def test_removes_only_the_standalone_custom3_loader(self) -> None:
+        payload = (
+            b"IMG TEXDB\\CUSTOM3.IMG\r\n"
+            b"IMG DATA\\SCRIPT\\SCRIPT.IMG\r\n"
+        )
+
+        self.assertEqual(
+            remove_custom3_loader(payload),
+            b"IMG DATA\\SCRIPT\\SCRIPT.IMG\r\n",
+        )
 
 
 if __name__ == "__main__":

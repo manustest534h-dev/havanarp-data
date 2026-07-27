@@ -15,12 +15,18 @@ import tempfile
 import zipfile
 from pathlib import Path
 
-from cdn_skin_migration import CdnSkinAssets, load_cdn_skin_assets
+from cdn_skin_migration import (
+    CdnSkinAssets,
+    load_cdn_skin_assets,
+    parse_texture_catalog,
+    validate_texture_links,
+)
 from skin_linkage import (
     CDN_SKIN_IDS,
     CUSTOM_SKIN_IDS,
     NATIVE_SKIN_IDS,
     img_index_size,
+    merge_img_archives,
     parse_img_index,
     parse_ped_definitions,
     repair_ped_definitions,
@@ -51,7 +57,8 @@ CUSTOM3_TEXTURES = tuple(
     for extension in ("dat", "tmb", "toc")
 ) + ("LuxuryMobile/texdb/custom3/custom3.txt",)
 CUSTOM3_LOAD_LINE = b"IMG TEXDB\\CUSTOM3.IMG"
-EXPECTED_FILE_COUNT = 427
+EXPECTED_FILE_COUNT = 416
+EXPECTED_SAMP_TEXTURE_NAMES = 2386
 
 
 def sha256(path: Path) -> str:
@@ -81,6 +88,83 @@ def read_img_index(archive: zipfile.ZipFile, name: str) -> set[str]:
     return parse_img_index(prefix)
 
 
+def texture_row_count(payload: bytes) -> int:
+    return sum(line.lstrip().startswith(b'"') for line in payload.splitlines())
+
+
+def merge_texture_metadata(base: bytes, addon: bytes) -> bytes:
+    """Append a disjoint mobile texdb catalog to an existing catalog."""
+
+    base_names = parse_texture_catalog(base)
+    addon_names = parse_texture_catalog(addon)
+    overlap = base_names.intersection(addon_names)
+    if overlap == addon_names:
+        return base
+    if overlap:
+        raise RuntimeError(
+            "texture catalogs contain a partial duplicate set: "
+            + ", ".join(sorted(overlap))
+        )
+    newline = b"\r\n" if base.count(b"\r\n") > base.count(b"\n") // 2 else b"\n"
+    rows = [line for line in addon.splitlines() if line.lstrip().startswith(b'"')]
+    if len(rows) != len(addon_names):
+        raise RuntimeError("CDN texture catalog contains duplicate names")
+    return base.rstrip(b"\r\n") + newline + newline.join(rows) + newline
+
+
+def merge_texture_toc(base: bytes, addon: bytes, base_size: int, addon_size: int) -> bytes:
+    """Merge mobile texdb offset tables while preserving missing-entry markers."""
+
+    if len(base) % 4 or len(addon) % 4:
+        raise RuntimeError("invalid mobile texture offset table")
+    base_values = list(struct.unpack(f"<{len(base) // 4}I", base))
+    addon_values = list(struct.unpack(f"<{len(addon) // 4}I", addon))
+    if not base_values or base_values[0] != base_size:
+        raise RuntimeError("base texture data size does not match its offset table")
+    if not addon_values or addon_values[0] != addon_size:
+        raise RuntimeError("CDN texture data size does not match its offset table")
+    shifted = [
+        value if value == 0xFFFFFFFF else value + base_size
+        for value in addon_values[1:]
+    ]
+    values = [base_size + addon_size, *base_values[1:], *shifted]
+    return struct.pack(f"<{len(values)}I", *values)
+
+
+def merge_texture_database(
+    archive: zipfile.ZipFile, cdn_assets: CdnSkinAssets
+) -> dict[str, bytes]:
+    """Merge the CDN textures into the launcher-supported samp texdb."""
+
+    base_metadata = archive.read("LuxuryMobile/texdb/samp/samp.txt")
+    addon_metadata = cdn_assets.textures["custom3.txt"]
+    merged_metadata = merge_texture_metadata(base_metadata, addon_metadata)
+    if merged_metadata == base_metadata:
+        return {}
+
+    replacements = {"LuxuryMobile/texdb/samp/samp.txt": merged_metadata}
+    base_rows = texture_row_count(base_metadata)
+    addon_rows = texture_row_count(addon_metadata)
+    for format_name in ("dxt", "etc", "pvr"):
+        prefix = f"LuxuryMobile/texdb/samp/samp.{format_name}"
+        base_dat = archive.read(f"{prefix}.dat")
+        base_tmb = archive.read(f"{prefix}.tmb")
+        base_toc = archive.read(f"{prefix}.toc")
+        addon_dat = cdn_assets.textures[f"custom3.{format_name}.dat"]
+        addon_tmb = cdn_assets.textures[f"custom3.{format_name}.tmb"]
+        addon_toc = cdn_assets.textures[f"custom3.{format_name}.toc"]
+        if len(base_toc) // 4 != base_rows + 1:
+            raise RuntimeError(f"base {format_name} texture catalog mismatch")
+        if len(addon_toc) // 4 != addon_rows + 1:
+            raise RuntimeError(f"CDN {format_name} texture catalog mismatch")
+        replacements[f"{prefix}.dat"] = base_dat + addon_dat
+        replacements[f"{prefix}.tmb"] = base_tmb + addon_tmb
+        replacements[f"{prefix}.toc"] = merge_texture_toc(
+            base_toc, addon_toc, len(base_dat), len(addon_dat)
+        )
+    return replacements
+
+
 def validate_archive(archive_path: Path) -> dict[int, str]:
     with zipfile.ZipFile(archive_path) as archive:
         names = archive.namelist()
@@ -92,9 +176,7 @@ def validate_archive(archive_path: Path) -> dict[int, str]:
             DATA_GTA,
             SAMP_GTA,
             SAMP_IMG,
-            CUSTOM3_IMG,
             *SAMP_TEXTURES,
-            *CUSTOM3_TEXTURES,
         }
         missing = sorted(required.difference(names))
         if missing:
@@ -104,17 +186,18 @@ def validate_archive(archive_path: Path) -> dict[int, str]:
         if data_peds != samp_peds:
             raise RuntimeError("data/peds.ide and SAMP/peds.ide are not identical")
         for name in (DATA_GTA, SAMP_GTA):
-            if CUSTOM3_LOAD_LINE not in archive.read(name).upper():
-                raise RuntimeError(f"custom3 model archive is not loaded by {name}")
+            if CUSTOM3_LOAD_LINE in archive.read(name).upper():
+                raise RuntimeError(f"unsafe custom3 model loader remains in {name}")
+        forbidden = {CUSTOM3_IMG, *CUSTOM3_TEXTURES}.intersection(names)
+        if forbidden:
+            raise RuntimeError("release archive still contains standalone custom3 assets")
         pedestrians = parse_ped_definitions(samp_peds)
         linked = validate_skin_links(
-            pedestrians, read_img_index(archive, SAMP_IMG), NATIVE_SKIN_IDS
+            pedestrians, read_img_index(archive, SAMP_IMG), CUSTOM_SKIN_IDS
         )
-        linked.update(
-            validate_skin_links(
-                pedestrians, read_img_index(archive, CUSTOM3_IMG), CDN_SKIN_IDS
-            )
-        )
+        metadata = archive.read("LuxuryMobile/texdb/samp/samp.txt")
+        if len(parse_texture_catalog(metadata)) != EXPECTED_SAMP_TEXTURE_NAMES:
+            raise RuntimeError("merged samp texture catalog is incomplete")
         return linked
 
 
@@ -144,11 +227,12 @@ def add_cdn_pedestrians(payload: bytes, rows: bytes) -> bytes:
     return repaired[:insertion] + section + repaired[insertion:]
 
 
-def add_custom3_loader(payload: bytes) -> bytes:
-    if CUSTOM3_LOAD_LINE in payload.upper():
-        return payload
-    newline = b"\r\n" if b"\r\n" in payload else b"\n"
-    return CUSTOM3_LOAD_LINE + newline + payload
+def remove_custom3_loader(payload: bytes) -> bytes:
+    return b"".join(
+        line
+        for line in payload.splitlines(keepends=True)
+        if line.strip().upper() != CUSTOM3_LOAD_LINE
+    )
 
 
 def patch_archive(
@@ -173,9 +257,20 @@ def patch_archive(
             parse_img_index(cdn_assets.model_archive[:custom_index_size]),
             CDN_SKIN_IDS,
         )
+        merged_samp_img = merge_img_archives(
+            archive.read(SAMP_IMG), cdn_assets.model_archive
+        )
+        merged_texture_files = merge_texture_database(archive, cdn_assets)
+        validate_texture_links(
+            cdn_assets.model_archive,
+            merged_texture_files.get(
+                "LuxuryMobile/texdb/samp/samp.txt",
+                archive.read("LuxuryMobile/texdb/samp/samp.txt"),
+            ),
+        )
         gta_files = {
-            DATA_GTA: add_custom3_loader(archive.read(DATA_GTA)),
-            SAMP_GTA: add_custom3_loader(archive.read(SAMP_GTA)),
+            DATA_GTA: remove_custom3_loader(archive.read(DATA_GTA)),
+            SAMP_GTA: remove_custom3_loader(archive.read(SAMP_GTA)),
         }
         source_timestamp = datetime.datetime(
             *archive.getinfo(SAMP_PEDS).date_time,
@@ -187,12 +282,9 @@ def patch_archive(
         replacements: dict[str, bytes] = {
             DATA_PEDS: repaired_peds,
             SAMP_PEDS: repaired_peds,
-            CUSTOM3_IMG: cdn_assets.model_archive,
+            SAMP_IMG: merged_samp_img,
             **gta_files,
-            **{
-                f"LuxuryMobile/texdb/custom3/{name}": payload
-                for name, payload in cdn_assets.textures.items()
-            },
+            **merged_texture_files,
         }
         for name, payload in replacements.items():
             target = staging / name
@@ -205,6 +297,17 @@ def patch_archive(
             cwd=staging,
             check=True,
         )
+        with zipfile.ZipFile(source) as archive:
+            removable = [
+                name
+                for name in (CUSTOM3_IMG, *CUSTOM3_TEXTURES)
+                if name in archive.namelist()
+            ]
+        if removable:
+            subprocess.run(
+                ["zip", "-q", "-d", str(destination), *removable],
+                check=True,
+            )
     return validate_archive(destination)
 
 
@@ -259,10 +362,10 @@ def write_metadata(
         },
         "skin_linkage": {
             "definitions": [DATA_PEDS, SAMP_PEDS],
-            "model_archives": [SAMP_IMG, CUSTOM3_IMG],
+            "model_archives": [SAMP_IMG],
             "custom_skin_count": len(linked_skins),
             "custom_skin_ids": sorted(linked_skins),
-            "texture_databases": [*SAMP_TEXTURES, *CUSTOM3_TEXTURES],
+            "texture_databases": [*SAMP_TEXTURES],
         },
     }
     (output_dir / "release.json").write_text(
