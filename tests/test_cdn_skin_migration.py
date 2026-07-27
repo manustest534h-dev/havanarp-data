@@ -11,6 +11,8 @@ sys.path.insert(0, str(Path(__file__).resolve().parents[1] / "scripts"))
 from cdn_skin_migration import (  # noqa: E402
     CONTAINER_MAGIC,
     container_payloads,
+    dff_texture_names,
+    parse_texture_catalog,
     select_pedestrian_rows,
     texture_groups,
 )
@@ -41,6 +43,21 @@ def ped_row(model_id: int, model: str, broken: bool = False) -> bytes:
     return (
         f"{model_id},{model},{model},CIVMALE,STAT,man,0,0,{middle},VOICE,VOICE\n"
     ).encode()
+
+
+def rw_chunk(kind: int, payload: bytes) -> bytes:
+    return struct.pack("<III", kind, len(payload), 0x1803FFFF) + payload
+
+
+def rw_texture(name: str) -> bytes:
+    encoded = name.encode() + b"\0"
+    encoded += b"\0" * (-len(encoded) % 4)
+    return rw_chunk(
+        6,
+        rw_chunk(1, b"\x06\x01\x01\0")
+        + rw_chunk(2, encoded)
+        + rw_chunk(2, b"\0\0\0\0"),
+    )
 
 
 class CdnSkinMigrationTests(unittest.TestCase):
@@ -80,6 +97,20 @@ class CdnSkinMigrationTests(unittest.TestCase):
 
         self.assertEqual(groups[1]["dat"], b"dat1")
         self.assertEqual(groups[1]["txt"], b"cat=0\n\"texture1\"\n")
+
+    def test_reads_renderware_texture_references(self) -> None:
+        payload = b"prefix" + rw_texture("Skin_Face") + rw_texture("Skin_Body")
+
+        self.assertEqual(dff_texture_names(payload), {"skin_face", "skin_body"})
+
+    def test_reads_mobile_texture_catalog(self) -> None:
+        payload = (
+            b"cat=0 name=Default\n"
+            b'"Skin_Face" width=256 height=256 img=1234\n'
+            b'"Skin_Body" "affiliate=shared_body"\n'
+        )
+
+        self.assertEqual(parse_texture_catalog(payload), {"skin_face", "skin_body"})
 
     def test_adds_cdn_rows_before_end_and_repairs_base_row(self) -> None:
         base = b"peds\n" + ped_row(51, "BMYMOUN", broken=True) + b"end\n"

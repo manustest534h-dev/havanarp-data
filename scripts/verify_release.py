@@ -9,8 +9,11 @@ import json
 import urllib.request
 import zlib
 
+from cdn_skin_migration import parse_texture_catalog
 from skin_linkage import (
+    CDN_SKIN_IDS,
     CUSTOM_SKIN_IDS,
+    NATIVE_SKIN_IDS,
     img_index_size,
     parse_img_index,
     parse_ped_definitions,
@@ -22,26 +25,36 @@ BASE_URL = (
     "https://github.com/manustest534h-dev/"
     "havanarp-data/releases/download/v1"
 )
-MANIFEST_SHA256 = "032d46df82134b1511ca9e99f2ac5aa2f618119cc30173a7b1699084545824a2"
-ARCHIVE_SHA256 = "108fb6947a6b220e419fbe6c6c956f0eaa0393c676b1e70babfc57fac5c5628f"
-ARCHIVE_SIZE = 1_387_227_370
-FILE_COUNT = 416
+MANIFEST_SHA256 = "7447d35d9e12ca2b6e86ce8c95684dacc673e50e26d1646978f14b0ead9b35a9"
+ARCHIVE_SHA256 = "186b1531cffeaf300148e1aae03a3c7f7770afe335570f84e453085cc87e75e8"
+ARCHIVE_SIZE = 1_435_793_981
+FILE_COUNT = 427
 CRITICAL_FILES = (
     "LuxuryMobile/data/clothes.dat",
+    "LuxuryMobile/data/gta.dat",
     "LuxuryMobile/data/peds.ide",
+    "LuxuryMobile/SAMP/gta.dat",
     "LuxuryMobile/SAMP/peds.ide",
     "LuxuryMobile/texdb/player.img",
     "LuxuryMobile/texdb/player/player.pvr.dat",
     "LuxuryMobile/texdb/playerhi/playerhi.pvr.dat",
+    "LuxuryMobile/texdb/custom3/custom3.txt",
     "LuxuryMobile/texdb/samp/samp.txt",
 )
 SAMP_IMG = "LuxuryMobile/texdb/samp.img"
+CUSTOM3_IMG = "LuxuryMobile/texdb/custom3.img"
+CUSTOM3_LOAD_LINE = b"IMG TEXDB\\CUSTOM3.IMG"
 SAMP_TEXTURES = (
     "LuxuryMobile/texdb/samp/samp.dxt.dat",
     "LuxuryMobile/texdb/samp/samp.etc.dat",
     "LuxuryMobile/texdb/samp/samp.pvr.dat",
     "LuxuryMobile/texdb/samp/samp.unc.dat",
 )
+CUSTOM3_TEXTURES = tuple(
+    f"LuxuryMobile/texdb/custom3/custom3.{format_name}.{extension}"
+    for format_name in ("dxt", "etc", "pvr")
+    for extension in ("dat", "tmb", "toc")
+) + ("LuxuryMobile/texdb/custom3/custom3.txt",)
 
 
 def fetch(url: str, headers: dict[str, str] | None = None) -> bytes:
@@ -130,19 +143,40 @@ def main() -> int:
 
     if extracted["LuxuryMobile/data/peds.ide"] != extracted["LuxuryMobile/SAMP/peds.ide"]:
         raise RuntimeError("pedestrian definitions are not mirrored")
+    for name in ("LuxuryMobile/data/gta.dat", "LuxuryMobile/SAMP/gta.dat"):
+        if CUSTOM3_LOAD_LINE not in extracted[name].upper():
+            raise RuntimeError(f"custom3 model archive is not loaded by {name}")
     pedestrians = parse_ped_definitions(extracted["LuxuryMobile/SAMP/peds.ide"])
     samp_item = by_name.get(SAMP_IMG)
     if samp_item is None:
         raise RuntimeError(f"missing critical file: {SAMP_IMG}")
-    img_names = parse_img_index(fetch_img_index(samp_item))
-    linked_skins = validate_skin_links(pedestrians, img_names)
+    native_skins = validate_skin_links(
+        pedestrians,
+        parse_img_index(fetch_img_index(samp_item)),
+        NATIVE_SKIN_IDS,
+    )
+    custom3_item = by_name.get(CUSTOM3_IMG)
+    if custom3_item is None:
+        raise RuntimeError(f"missing critical file: {CUSTOM3_IMG}")
+    cdn_skins = validate_skin_links(
+        pedestrians,
+        parse_img_index(fetch_img_index(custom3_item)),
+        CDN_SKIN_IDS,
+    )
+    linked_skins = {**native_skins, **cdn_skins}
     if set(linked_skins) != set(CUSTOM_SKIN_IDS):
         raise RuntimeError("unexpected custom skin IDs")
-    for name in SAMP_TEXTURES:
+    catalog = parse_texture_catalog(
+        extracted["LuxuryMobile/texdb/custom3/custom3.txt"]
+    )
+    if len(catalog) != 247:
+        raise RuntimeError(f"custom3 texture catalog mismatch: {len(catalog)}")
+    for name in (*SAMP_TEXTURES, *CUSTOM3_TEXTURES):
         item = by_name.get(name)
         if item is None or int(item["s"]) <= 0:
-            raise RuntimeError(f"missing SAMP texture database: {name}")
+            raise RuntimeError(f"missing texture database: {name}")
     print(f"PASS custom skin linkage ({len(linked_skins)} models)")
+    print(f"PASS custom3 texture catalog ({len(catalog)} textures)")
 
     release = json.loads(fetch(f"{BASE_URL}/release.json"))
     if int(release["version"]) != 3:
@@ -154,6 +188,15 @@ def main() -> int:
     linkage = release.get("skin_linkage", {})
     if int(linkage.get("custom_skin_count", 0)) != len(CUSTOM_SKIN_IDS):
         raise RuntimeError("release skin linkage metadata mismatch")
+    if set(linkage.get("custom_skin_ids", [])) != set(CUSTOM_SKIN_IDS):
+        raise RuntimeError("release custom skin IDs mismatch")
+    if set(linkage.get("model_archives", [])) != {SAMP_IMG, CUSTOM3_IMG}:
+        raise RuntimeError("release model archive metadata mismatch")
+    if set(linkage.get("texture_databases", [])) != {
+        *SAMP_TEXTURES,
+        *CUSTOM3_TEXTURES,
+    }:
+        raise RuntimeError("release texture database metadata mismatch")
     print(f"PASS manifest ({FILE_COUNT} files)")
     print(f"PASS archive metadata ({ARCHIVE_SIZE} bytes)")
     return 0

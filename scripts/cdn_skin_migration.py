@@ -4,7 +4,7 @@
 from __future__ import annotations
 
 import hashlib
-import io
+import re
 import struct
 import urllib.request
 import zipfile
@@ -33,6 +33,17 @@ CDN_PACKAGES = {
     "data": ".data",
 }
 CONTAINER_MAGIC = bytes.fromhex("b8d45c1f")
+RW_TEXTURE_CHUNK = b"\x06\x00\x00\x00"
+# These references are already unresolved in the signed v763 CDN bundle. One
+# comes from the base player database; the other three are unused material slots.
+KNOWN_LEGACY_TEXTURE_REFERENCES = frozenset(
+    {
+        "air95_lp",
+        "grinch_telo",
+        "material__640_2d_view",
+        "sneakerbincblk",
+    }
+)
 
 
 @dataclass(frozen=True)
@@ -194,6 +205,102 @@ def texture_groups(container: bytes, expected_count: int) -> list[dict[str, byte
     return groups
 
 
+def parse_texture_catalog(payload: bytes) -> set[str]:
+    """Return texture names declared by a mobile texdb metadata file."""
+
+    names: set[str] = set()
+    for line in payload.splitlines():
+        match = re.match(br'"([^"\r\n]+)"', line.strip())
+        if not match:
+            continue
+        try:
+            names.add(match.group(1).decode("ascii").lower())
+        except UnicodeDecodeError as error:
+            raise RuntimeError("non-ASCII texture name in CDN metadata") from error
+    if not names:
+        raise RuntimeError("CDN texture metadata does not declare any textures")
+    return names
+
+
+def dff_texture_names(payload: bytes) -> set[str]:
+    """Read texture-name string chunks from a RenderWare DFF model."""
+
+    names: set[str] = set()
+    offset = -1
+    while True:
+        offset = payload.find(RW_TEXTURE_CHUNK, offset + 1)
+        if offset < 0:
+            break
+        if offset + 36 > len(payload):
+            continue
+        _, texture_size, texture_version = struct.unpack_from("<III", payload, offset)
+        texture_end = offset + 12 + texture_size
+        if not texture_version or texture_end > len(payload):
+            continue
+
+        struct_offset = offset + 12
+        struct_type, struct_size, _ = struct.unpack_from("<III", payload, struct_offset)
+        if struct_type != 1 or struct_size < 4:
+            continue
+        string_offset = struct_offset + 12 + struct_size
+        if string_offset + 12 > texture_end:
+            continue
+        string_type, string_size, _ = struct.unpack_from("<III", payload, string_offset)
+        if string_type != 2 or not 0 < string_size <= 128:
+            continue
+        string_end = string_offset + 12 + string_size
+        if string_end > texture_end:
+            continue
+        raw_name = payload[string_offset + 12 : string_end].split(b"\0", 1)[0]
+        try:
+            name = raw_name.decode("ascii").lower()
+        except UnicodeDecodeError:
+            continue
+        if name:
+            names.add(name)
+    return names
+
+
+def img_model_payloads(payload: bytes) -> dict[str, bytes]:
+    """Return DFF payloads from a complete GTA IMG v2 archive."""
+
+    index_size = 8 + (struct.unpack_from("<I", payload, 4)[0] * 32)
+    names = parse_img_index(payload[:index_size])
+    models: dict[str, bytes] = {}
+    for index in range(struct.unpack_from("<I", payload, 4)[0]):
+        offset = 8 + (index * 32)
+        sector, stream_sectors, archive_sectors = struct.unpack_from(
+            "<IHH", payload, offset
+        )
+        raw_name = payload[offset + 8 : offset + 32].split(b"\0", 1)[0]
+        name = raw_name.decode("ascii").lower()
+        if not name.endswith(".dff"):
+            continue
+        sectors = archive_sectors or stream_sectors
+        start = sector * 2048
+        end = start + (sectors * 2048)
+        if name not in names or not sectors or end > len(payload):
+            raise RuntimeError(f"invalid CDN model payload: {name}")
+        models[name] = payload[start:end]
+    return models
+
+
+def validate_texture_links(model_archive: bytes, metadata: bytes) -> int:
+    """Ensure the selected texdb matches texture references in its DFF files."""
+
+    catalog = parse_texture_catalog(metadata)
+    referenced: set[str] = set()
+    for payload in img_model_payloads(model_archive).values():
+        referenced.update(dff_texture_names(payload))
+    if not referenced:
+        raise RuntimeError("CDN skin models do not contain texture references")
+    unresolved = referenced.difference(catalog)
+    if unresolved != KNOWN_LEGACY_TEXTURE_REFERENCES:
+        names = ", ".join(sorted(unresolved)) or "none"
+        raise RuntimeError(f"unexpected CDN texture references: {names}")
+    return len(referenced)
+
+
 def load_cdn_skin_assets(source_dir: Path | None, cache_dir: Path) -> CdnSkinAssets:
     packages: dict[str, bytes] = {}
     for name, inner_name in CDN_PACKAGES.items():
@@ -238,4 +345,5 @@ def load_cdn_skin_assets(source_dir: Path | None, cache_dir: Path) -> CdnSkinAss
     if common_text is None:
         raise RuntimeError("CDN texture metadata is missing")
     textures["custom3.txt"] = common_text
+    validate_texture_links(model_archive, common_text)
     return CdnSkinAssets(model_archive, pedestrian_rows, textures)
